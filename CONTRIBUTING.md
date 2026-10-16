@@ -84,8 +84,9 @@ From v2 on, the module path must end in `/v2`.
 
 Pushing a `v*` tag runs [.github/workflows/release.yml](.github/workflows/release.yml),
 which tests the tagged commit, publishes a GitHub release with notes
-generated from the pull requests since the previous tag, and asks the Go
-module proxy for the new version so that pkg.go.dev lists it. A tag with a
+generated from the pull requests since the previous tag and a CycloneDX
+SBOM (`rypt-<tag>.cdx.json`) of the module and its requirements, and asks
+the Go module proxy for the new version so that pkg.go.dev lists it. A tag with a
 pre-release suffix, such as `v0.2.0-rc.1`, is published as a pre-release.
 
 Never move or delete a tag once it is pushed: the Go module proxy and
