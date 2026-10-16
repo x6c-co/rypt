@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -429,5 +430,90 @@ func TestIsUUID(t *testing.T) {
 		if isUUID(s) != want {
 			t.Errorf("isUUID(%q) = %v", s, !want)
 		}
+	}
+}
+
+// TestRetrySendsSameRequest: every attempt sends the same body and headers.
+func TestRetrySendsSameRequest(t *testing.T) {
+	api := newFakeAPI(t)
+	api.script(dropConn(), apiErr(503, "unavailable", ""))
+	api.fallback = jsonReply(200, map[string]any{"ciphertext": b64([]byte("CT"))})
+	if _, err := api.client().Encrypt(t.Context(), keyID, []byte("plaintext"), []byte("aad")); err != nil {
+		t.Fatal(err)
+	}
+	reqs := api.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("sent %d requests, want 3", len(reqs))
+	}
+	for _, r := range reqs[1:] {
+		if !bytes.Equal(r.body, reqs[0].body) || r.header.Get("Authorization") != reqs[0].header.Get("Authorization") {
+			t.Errorf("a retry sent %q, the first attempt %q", r.body, reqs[0].body)
+		}
+	}
+}
+
+// TestClientTimeoutRetried: an http.Client timeout is a transport failure,
+// not the caller's deadline, so a call that is safe to repeat is retried.
+func TestClientTimeoutRetried(t *testing.T) {
+	api := newFakeAPI(t)
+	api.script(func(w http.ResponseWriter, r *http.Request) { time.Sleep(300 * time.Millisecond) })
+	api.fallback = jsonReply(200, []any{})
+	c := api.client(WithHTTPClient(&http.Client{Timeout: 100 * time.Millisecond}))
+	if _, err := c.ListKeys(t.Context()); err != nil {
+		t.Fatalf("got %v, want success on the retry", err)
+	}
+	if n := len(api.requests()); n != 2 {
+		t.Errorf("sent %d requests, want 2", n)
+	}
+}
+
+// TestContextCanceledDuringRequest: the caller's context ending mid-request
+// returns the context's error and is not retried.
+func TestContextCanceledDuringRequest(t *testing.T) {
+	api := newFakeAPI(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	api.fallback = func(w http.ResponseWriter, r *http.Request) {
+		cancel()
+		<-r.Context().Done()
+	}
+	_, err := api.client().ListKeys(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("got %v, want context.Canceled", err)
+	}
+	if _, ok := err.(*Error); ok {
+		t.Error("a canceled call returned an *Error")
+	}
+	if n := len(api.requests()); n != 1 {
+		t.Errorf("sent %d requests, want 1", n)
+	}
+}
+
+// TestTLS: an untrusted certificate fails at once, and a trusted one works.
+func TestTLS(t *testing.T) {
+	var hits int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		jsonReply(200, []any{})(w, r)
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(testToken, WithBaseURL(srv.URL), WithBackoff(noBackoff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.ListKeys(t.Context())
+	if e := asError(t, err); e.Kind != KindTransport || e.Attempts != 1 {
+		t.Errorf("untrusted certificate: got %s", sprint(e))
+	}
+	if hits != 0 {
+		t.Errorf("the server answered %d requests over an untrusted connection", hits)
+	}
+
+	c, err = NewClient(testToken, WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListKeys(t.Context()); err != nil {
+		t.Errorf("trusted certificate: %v", err)
 	}
 }
