@@ -35,8 +35,10 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $prerelease
 
       # Ask the Go module proxy for the new version, so that it and
-      # pkg.go.dev list it without waiting for someone to request it.
+      # pkg.go.dev list it without waiting for someone to request it. The
+      # release is already published, so a slow proxy does not fail it.
       - name: Announce the version to the Go module proxy
+        continue-on-error: true
         env:
           TAG: ${{ github.ref_name }}
         run: curl -sSf "https://proxy.golang.org/github.com/${GITHUB_REPOSITORY}/@v/${TAG}.info"
