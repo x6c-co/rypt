@@ -1,0 +1,31 @@
+# Dependabot opens its pull requests against development, like any other
+# change. See CONTRIBUTING.md.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    target-branch: development
+    schedule:
+      interval: weekly
+    # Wait a week after a release before proposing it, so that a
+    # compromised release is more likely to be caught first.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: deps
+    groups:
+      go-modules:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: development
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns: ["*"]

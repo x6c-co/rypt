@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+      - run: make vet race
+
+      # A tag with a pre-release suffix, such as v1.2.0-rc.1, is published
+      # as a pre-release.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=
+          case "$TAG" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $prerelease
+
+      # Ask the Go module proxy for the new version, so that it and
+      # pkg.go.dev list it without waiting for someone to request it.
+      - name: Announce the version to the Go module proxy
+        env:
+          TAG: ${{ github.ref_name }}
+        run: curl -sSf "https://proxy.golang.org/github.com/${GITHUB_REPOSITORY}/@v/${TAG}.info"
