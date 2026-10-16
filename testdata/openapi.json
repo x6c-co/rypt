@@ -1,0 +1,3758 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "rypt",
+    "version": "0.15.0",
+    "description": "Multi-tenant encryption as a service in front of Google Cloud KMS. A\ntenant authenticates with an API token and never touches GCP: key material\nlives in one GCP project owned by the operator.\n\nTwo modes are offered. **Direct** — `encrypt` and `decrypt` of payloads up\nto 64 KiB. **Envelope** — `wrap`, `unwrap` and `rewrap` of data keys.\n\nBinary fields are standard base64 with padding, on the way in and on the\nway out. Every response carries an `x-request-id` header, and every error\nbody repeats it.\n\nTwo credentials reach this API. An **API token** (`bearerAuth`) is the\nmachine credential and is the only one the five metered cryptographic\noperations accept. An **Auth0 access token** (`consoleAuth`) is what the\ndashboard uses, and is the only one that may mint or revoke an API token.\nBoth resolve to one tenant, and the endpoints in between — the key\nlifecycle, usage and the audit log — take either. The console endpoints\nexist only where a deployment has configured Auth0; without it they are not\nroutes.\n\nFour tiers decide the Cloud KMS protection level, how many key versions\nare retained, how many operations a month are included, and what one\npast that costs. A key's tier is fixed at creation. A rotation retires\nthe versions beyond the retained count, and each keeps decrypting for\nseven days before it is destroyed.\n\n| tier | protection | retained versions | ops included per month | past the cap | per key-month | per op past the cap |\n|---|---|---|---|---|---|---|\n| `free` | wrapped | 1 | 10,000 | `encrypt`, `wrap`, `rewrap` refused, `429 ops_cap_reached`; `decrypt`, `unwrap` go on | — | — |\n| `wrapped` | wrapped | 1 | 50,000 | recorded as overage | $3.00 | $0.00001 |\n| `software` | SOFTWARE | 3 | 100,000 | recorded as overage | $10.00 | $0.00002 |\n| `hsm` | HSM | 2 | 250,000 | recorded as overage | $35.00 | $0.00005 |\n\n`wrapped` is the free tier's backend without its hard cap: a rypt data key\nwrapped by a shared Cloud KMS root, so it costs no CryptoKey of its own.\nPrices are before tax, and a paid key is billed in arrears, by the UTC\ncalendar month.\n\nFrom October 2026 each paid key is billed by the day. Its monthly fee, the\nprice of a key-month, is split evenly across the days of the month, and\nthe key pays for every day it exists in, even part of a day: one that\nexists all month pays the whole fee, and one made and deleted the same day\npays one day. Its included operations are split the same way, rounded down\n— a key that exists for 10 days of a 30-day month includes 10/30 of its\ntier's ops included per month — and every operation past that share is\noverage, at the price in the last column.\n\nDeleting a key stops its billing after the day its deletion is requested,\nnot when it is destroyed. Restoring a key is free as an action, but the\nkey is then billed as if it was never deleted: its pending days are\nbilled. A month that has already ended is not reopened, though: pending\ndays in an earlier month stay unbilled, and that month's included\noperations stay as they were at its end.\n\nA month before October 2026 is billed by the key-month: a paid key pays a\nwhole key-month, and gets the whole allowance, for every month it exists in\nat any point, with three exceptions. A paid key deleted within 24 hours of\nbeing created, and not restored, is never billed a key-month; a key's\nbilling ends when its deletion is requested, not when it is destroyed; and\na key created on a month's last day (UTC) is not billed for that month.\n\nDeleting a key does not destroy it. The key is pending deletion for seven\ndays: it refuses every operation with `409 key_pending_deletion`, keeps\nits name and its versions, and can be restored, which is free as an action\nand bills the key as above. It is destroyed after that, or at once with\ndelete now from the console.\n\nKeys, API tokens and firewalls live in **containers**, and an API token\nnever sees outside its own: another container's key is the same `404` as\nanother tenant's, everywhere, and it creates keys in its own container\nalone. Every tenant has a default container, which everything goes in unless\ntold otherwise; the console makes, renames and deletes the rest. A console\nsession sees every container.\n\nWithin its container an API token can be restricted from the console: held\nto a **firewall**, a named list of networks that any number of the\ncontainer's API tokens can share, and to particular keys. One used from\noutside its firewall's networks is `403 ip_not_allowed`, checked before\nits secret and before its rate limit, so a request the firewall refuses\nnever spends the key's 100 requests a second. One restricted to\nparticular keys is\n`403 key_not_allowed` on any other key, cannot create a key, and sees only\nits own keys in `GET /v1/keys` and `GET /v1/usage`. A change to either, a\nfirewall's networks included, applies from the key's next request.\n\nAn API token may also do only what it was given: its `allowed_actions`. Six\nuse or rotate the keys it may act on — `encrypt`, `decrypt`, `wrap`,\n`unwrap`, `rewrap` and `rotate` — and four manage them: `create`, `rename`,\n`delete` and `restore`. Anything else on those routes is\n`403 action_not_allowed`, and is recorded in the audit log as that\noperation, failed. A new key is given nothing unless its creator names\nsomething, and API tokens made before 0.8.0 have at most the first six, so\nthey cannot create, rename, delete or restore a key until they are given\nthose actions. The decision is made by a Cerbos policy decision point\nrunning beside the service; when it does not answer, the request is\n`503 unavailable`, never allowed. A key that is not one of the API token's\ncontainer's live keys is a `404` before anything is asked, whatever the\naction, and the policy decision point is told the tenant and container\nof the API token and of the key and allows nothing across either, as a\nsecond check beside the service's own.\n\nAn eleventh action, `read`, is needed from 0.14.0 to list keys\n(`GET /v1/keys`), read a key (`GET /v1/keys/{id}`) and its audit log,\nand read usage (`GET /v1/usage`); without it they are\n`403 action_not_allowed`, which is not recorded in the audit log, as no\nread is. Every API token that existed when 0.14.0 was deployed was given\n`read` then; one made afterwards has it only if it is given it. Reads\nnow ask the policy decision point too, so when it does not answer they\nare `503 unavailable` like everything else an API token does.\n\nBilling is the deployment's choice. Where it is configured (which needs\nthe console too), a tenant may hold one live `free` key — a free key\npending deletion still holds the place — a paid key can\nonly be created while the tenant's billing is in good standing, and\n`encrypt`, `wrap` and `rewrap` on a paid key are refused with\n`402 billing_required` once it is not — while `decrypt` and `unwrap`\nkeep working, so lapsed billing never holds data hostage. Where it is\nnot configured, none of that applies and every tier is open to every\ntenant.\n",
+    "license": {
+      "name": "MIT OR Apache-2.0"
+    },
+    "contact": {
+      "name": "rypt",
+      "url": "https://api.rypt.dev"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://api.rypt.dev",
+      "description": "Production"
+    },
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "Local development"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "keys",
+      "description": "Key lifecycle — create, list, read, rename, rotate, and deletion:\ndelete, restore and destroy.\n"
+    },
+    {
+      "name": "crypto",
+      "description": "The five metered cryptographic operations."
+    },
+    {
+      "name": "audit",
+      "description": "The append-only record of every mutating operation."
+    },
+    {
+      "name": "usage",
+      "description": "Per-key operation counters for a calendar month."
+    },
+    {
+      "name": "console",
+      "description": "The dashboard API: the signed-in user, the containers, the API tokens they\nissue and restrict, the firewalls they hold them to, and the tenant's\nbilling. Auth0 access tokens only — an API token may not\nmint or revoke a credential, or spend the tenant's money. Present only\nwhen the deployment configures a console; the billing endpoints only\nwhen it configures billing too.\n"
+    },
+    {
+      "name": "billing",
+      "description": "Stripe's side of billing: the webhook Stripe delivers subscription\nevents to. Not for clients. Present only when the deployment\nconfigures billing.\n"
+    },
+    {
+      "name": "health",
+      "description": "Liveness, unauthenticated."
+    }
+  ],
+  "paths": {
+    "/v1/keys": {
+      "post": {
+        "tags": [
+          "keys"
+        ],
+        "operationId": "createKey",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Create a key",
+        "description": "Creates a Cloud KMS CryptoKey (or, for a `free` or `wrapped` key while\na wrapped root is configured, a wrapped key in Postgres) and returns\nthe `key` object. The name must be unique among the tenant's live keys,\nwhich include keys pending deletion; a collision is `409 key_exists`. A\nkey's name is free again once the key is destroyed.\n\nWhere the deployment configures billing, two more rules apply. A\ntenant holds at most one live `free` key, so a second is\n`409 free_key_exists`; a free key pending deletion still counts, and\ndestroying it frees the slot. And a paid\ntier — `wrapped`, `software` or `hsm` — needs the tenant's billing in\ngood standing, because the key starts accruing a monthly fee the\nmoment it exists: without it the request is `402 billing_required`,\nand the refusal is audited as a failed `create_key`.\n\nThe key goes in `container_id`: for an API token its own container,\nwhich is also where it goes when the field is absent, and naming any\nother is `400 invalid_container`; for a console session any of the\ntenant's containers, or the default one when absent. Its name is unique\namong its container's live keys.\n\nAn API token restricted to particular keys is `403 key_not_allowed`,\naudited the same way: the key it made would be outside its own list.\nThen an API token needs `create` among its `allowed_actions`: without it\nthe request is `403 action_not_allowed`, also audited as a failed\n`create_key`. A console session needs neither.\n",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "tier"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$",
+                    "description": "1–128 characters, no control characters, unique among the\ntenant's live keys, pending ones included. A name that is\nonly whitespace is also rejected, which this schema cannot\nexpress.\n",
+                    "example": "prod-database"
+                  },
+                  "tier": {
+                    "type": "string",
+                    "enum": [
+                      "free",
+                      "wrapped",
+                      "software",
+                      "hsm"
+                    ],
+                    "description": "Fixed at creation; lower case.",
+                    "example": "software"
+                  },
+                  "container_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "The container the key goes in, fixed at creation. Absent:\nan API token's own container, or the tenant's default for a\nconsole session.\n"
+                  }
+                }
+              },
+              "example": {
+                "name": "prod-database",
+                "tier": "software"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The created key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Key"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "409": {
+            "description": "`key_exists` — the tenant already has a live key with that name,\npending deletion or not — or, where billing is configured,\n`free_key_exists`: the tier is `free` and the tenant already has a\nlive `free` key, pending deletion or not.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "keys"
+        ],
+        "operationId": "listKeys",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "List keys",
+        "description": "The live keys the caller may see, oldest first: every key not yet\ndestroyed, those pending deletion included — for a console session the\nwhole tenant's, for an API token its container's, and for one restricted\nto particular keys only those. Not metered, not audited.\n",
+        "responses": {
+          "200": {
+            "description": "The tenant's live keys.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Key"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}": {
+      "get": {
+        "tags": [
+          "keys"
+        ],
+        "operationId": "getKey",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Get a key",
+        "description": "A key pending deletion is returned like any other, with its `state`;\na destroyed key is `404`. Not metered, not audited.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Key"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "keys"
+        ],
+        "operationId": "renameKey",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Rename a key",
+        "description": "Gives the key a new name and returns it. The name is the only thing\nabout a key that changes after it is created: its id, tier, versions\nand ciphertext are untouched, so nothing that uses the key by its id\nnotices. The new name is held to the rules of a name at creation and\nmust be unique among the tenant's live keys, pending ones included;\na collision is `409 key_exists`. The old name is free at once.\n\nA key pending deletion is `409 key_pending_deletion` and keeps its name\nuntil it is restored. Renaming a key to the name it already has changes\nnothing, answers the same `200` and writes no audit row; every other\nattempt, refused or not, is audited as `rename_key`. An API token needs\n`rename` among its `allowed_actions`: without it the request is\n`403 action_not_allowed`, audited as a failed `rename_key`.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$",
+                    "description": "1–128 characters, no control characters, unique among the\ntenant's live keys, pending ones included. A name that is\nonly whitespace is also rejected, which this schema cannot\nexpress.\n",
+                    "example": "orders-database"
+                  }
+                }
+              },
+              "example": {
+                "name": "orders-database"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The key, renamed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Key"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`key_exists` — another live key of the tenant's, pending deletion\nor not, has that name — or `key_pending_deletion`: this key is\npending deletion and refuses every operation until it is restored.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "keys"
+        ],
+        "operationId": "deleteKey",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Delete a key",
+        "description": "Puts the key in pending deletion and returns it. Nothing is destroyed\nand Cloud KMS is not called: from now on every operation on the key —\nthe five cryptographic ones, `decrypt` and `unwrap` included, and\n`rotate` — is `409 key_pending_deletion`, while the key keeps its name\nand its versions. It is destroyed after `destroy_after`, seven days\non, unless it is restored first with `POST /v1/keys/{id}/restore`.\n`POST /v1/keys/{id}/destroy`, from the console, destroys it at once.\n\nDeleting a key that is already pending changes nothing, its dates\nincluded, and answers the same, so a retried request is harmless; only\nthe first is audited. An API token needs `delete` among its\n`allowed_actions`: without it the request is `403 action_not_allowed`,\naudited as a failed `delete_key`.\n\nDeleting a paid key stops its billing after the day of the request,\nnot when the key is destroyed. From October 2026 a key is billed by\nthe day, that day included. Restoring it is free as an action, but the\nkey is then billed as if it was never deleted: its pending days are\nbilled, except those in a month that has already ended, which is not\nreopened. In a month before October 2026 its key-months stop with the\nmonth of the request, and a paid key deleted within 24 hours of being\ncreated, and not restored, is never billed a key-month.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The key, now pending deletion.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Key"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/rotate": {
+      "post": {
+        "tags": [
+          "keys"
+        ],
+        "operationId": "rotateKey",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Rotate a key",
+        "description": "Creates a new version and makes it primary, so new ciphertext is made\nunder it. The versions beyond the tier's retained count (`free` 1,\n`wrapped` 1, `software` 3, `hsm` 2), oldest first, are retired: each\nkeeps decrypting, unwrapping and rewrapping for seven days, and is\nlisted in `retiring_versions` with the time it is destroyed. A version\nalready retiring does not count against the retained count, and keeps\nits date.\n\nOn `free` and `wrapped` there is exactly one retained version, so every\nrotation retires the previous one. **Rotate, then rewrap within seven\ndays** everything still under the retired version: once it is\ndestroyed, that ciphertext can never be decrypted again, and\n`decrypt`, `unwrap` and `rewrap` answer `400 invalid_ciphertext`.\n\nA key may have at most ten versions retiring at once. A rotation that\nwould go past that is `409 too_many_retiring_versions`, and creates\nnothing; the message says when the next one is destroyed. A key\npending deletion is `409 key_pending_deletion`. Where billing is\nconfigured, a paid key whose tenant's billing has lapsed is `402\nbilling_required`: rewrap is refused then, so a rotation would leave\ndata that could be read but never moved off the retired version. For\nthe same reason a `free` key at its monthly cap is `429\nops_cap_reached` until the cap resets. Takes no request body.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The key, with its new primary version.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Key"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`key_pending_deletion` — the key is pending deletion and refuses\nevery operation until it is restored — or\n`too_many_retiring_versions`: the key already has ten versions\nretiring, and the message says when the next one is destroyed.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/restore": {
+      "post": {
+        "tags": [
+          "keys"
+        ],
+        "operationId": "restoreKey",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Restore a key pending deletion",
+        "description": "Takes the key out of pending deletion and returns it active again.\nRestoring is free as an action, but the key is then billed as if it\nwas never deleted: its pending days are billed. A month that has\nalready ended is not reopened: pending days in an earlier month stay\nunbilled, and that month's included operations stay as they were at\nits end.\n\nOnce `destroy_after` has passed the key can no longer be restored,\neven while it is still listed as pending: its destruction may already\nhave begun.\n\nAn API token needs `restore` among its `allowed_actions`: without it the\nrequest is `403 action_not_allowed`, audited as a failed `restore_key`.\n\nTakes no request body.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The key, active again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Key"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`not_pending_deletion` — the key is not pending deletion, so there\nis nothing to restore — or `restore_window_closed`: its\n`destroy_after` has passed and it is being destroyed.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/destroy": {
+      "post": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "destroyKey",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Destroy a key now",
+        "description": "Delete now: schedules every enabled version for destruction and\ndestroys the key at once, whether it was pending deletion or not —\nfor a key that must stop existing now rather than in seven days. From\nthen on it is `404` like an id that was never issued, and its name,\nand a free key's place, are free immediately. This cannot be undone\nfrom the API or the dashboard; Cloud KMS keeps the key material for its\nown 24-hour destruction window, which only the operator can reach\ninto.\n\nThe key is first made pending and due, and only then destroyed. If\nthe destruction fails part-way it stays that way: it refuses every\noperation, answers restore with `409 restore_window_closed`, and is\ndestroyed by a retry or, within minutes while the service is busy, by\nthe service itself.\n\nConsole only, like minting an API token: an API token that leaked can\ndelete keys, but each such deletion waits seven days and can be\nundone, whereas one that could destroy would take them for good. An\nAPI token is `403 session_required`.\n\nA key destroyed while pending keeps the time its deletion was\nrequested, and its billing still ends then, not when it is destroyed:\nfrom October 2026 it is billed through the day of the request, and in\na month before, one deleted within 24 hours of being created is still\nnot billed. Takes no request body.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Destroyed. No body."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/encrypt": {
+      "post": {
+        "tags": [
+          "crypto"
+        ],
+        "operationId": "encrypt",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Encrypt a payload",
+        "description": "One metered operation. The ciphertext names the key version it was made\nunder, so `decrypt` keeps working across rotations with no metadata\nstored by the caller.\n\nOn the `hsm` tier `plaintext` and `aad` may total at most 8,176 bytes\ndecoded — Cloud KMS's own 8,192-byte HSM limit, less the 16 bytes of\ntenant id the service binds into the AAD — tighter than the limit each\nfield carries here. That combined rule is per-tier and cannot be\nexpressed in this schema.\n\nOn a paid key, where the deployment configures billing, this is\n`402 billing_required` while the tenant's billing is not in good\nstanding: new ciphertext is what a paid key is for. It is refused\nbefore Cloud KMS is called, audited, and not counted.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "plaintext"
+                ],
+                "properties": {
+                  "plaintext": {
+                    "type": "string",
+                    "format": "byte",
+                    "minLength": 4,
+                    "maxLength": 87384,
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "Payload to encrypt, standard padded base64. 1–65,536 bytes\ndecoded; empty is rejected.\n",
+                    "example": "aGVsbG8gd29ybGQ="
+                  },
+                  "aad": {
+                    "type": "string",
+                    "nullable": true,
+                    "format": "byte",
+                    "maxLength": 87384,
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "Additional authenticated data, standard padded base64, at\nmost 65,520 bytes decoded on a `software` or `hsm` key and\n65,536 on a `free` or `wrapped` one. The service binds the\ntenant id into it, so the ciphertext opens only for this\ntenant. The same value must be presented on `decrypt` and\n`rewrap`. Omit it, send `null`, or send `\"\"`, when none\nwas used.\n",
+                    "example": "dGVuYW50PWFjbWU7dGFibGU9dXNlcnM="
+                  }
+                }
+              },
+              "example": {
+                "plaintext": "aGVsbG8gd29ybGQ="
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The ciphertext.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CiphertextResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/KeyPendingDeletion"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/decrypt": {
+      "post": {
+        "tags": [
+          "crypto"
+        ],
+        "operationId": "decrypt",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Decrypt a ciphertext",
+        "description": "One metered operation. Works for any version the key still retains, not\njust the primary.\n\nA ciphertext the backend refuses, an `aad` that does not match, or a\nciphertext naming a version that is no longer enabled is\n`400 invalid_ciphertext`.\n\nNever refused for billing: a tenant whose billing has lapsed can\nstill read back everything it encrypted. Refused, like every\noperation, on a key pending deletion: restore the key to use it.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ciphertext"
+                ],
+                "properties": {
+                  "ciphertext": {
+                    "type": "string",
+                    "format": "byte",
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "A ciphertext this key produced, standard padded base64.\n",
+                    "example": "CiQALS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZ"
+                  },
+                  "aad": {
+                    "type": "string",
+                    "nullable": true,
+                    "format": "byte",
+                    "maxLength": 87384,
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "The same additional authenticated data the ciphertext was\nmade with. Omit it, send `null`, or send `\"\"`, when none\nwas used.\n",
+                    "example": "dGVuYW50PWFjbWU7dGFibGU9dXNlcnM="
+                  }
+                }
+              },
+              "example": {
+                "ciphertext": "CiQALS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZ"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The recovered plaintext.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "plaintext"
+                  ],
+                  "properties": {
+                    "plaintext": {
+                      "type": "string",
+                      "format": "byte",
+                      "description": "The recovered plaintext, base64."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/KeyPendingDeletion"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/wrap": {
+      "post": {
+        "tags": [
+          "crypto"
+        ],
+        "operationId": "wrap",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Wrap a data key",
+        "description": "One metered operation. With no `dek`, rypt generates 32 random bytes\nand returns both the data key and its wrapped form; with a `dek` of 16,\n24 or 32 bytes, only `wrapped` comes back.\n\nAn optional `aad` binds the wrapped key to its context, so a `wrapped`\nvalue copied to another record does not unwrap there: `unwrap` must be\ngiven the same `aad`, and a mismatch is `400 invalid_ciphertext`.\n\nSend `{}` to have one generated.\n\nOn a paid key, where the deployment configures billing, this is\n`402 billing_required` while the tenant's billing is not in good\nstanding, as `encrypt` is. It is refused before Cloud KMS is called,\naudited, and not counted.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "dek": {
+                    "type": "string",
+                    "nullable": true,
+                    "format": "byte",
+                    "minLength": 24,
+                    "maxLength": 44,
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "Data key to wrap, standard padded base64, decoding to 16,\n24 or 32 bytes. Absent or `null` means \"generate one\", and\nthen the response returns it.\n",
+                    "example": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="
+                  },
+                  "aad": {
+                    "type": "string",
+                    "nullable": true,
+                    "format": "byte",
+                    "maxLength": 87384,
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "Additional authenticated data, standard padded base64, at\nmost 65,520 bytes decoded on a `software` or `hsm` key and\n65,536 on a `free` or `wrapped` one, binding the wrapped\nkey to its context. The same value must be presented on\n`unwrap`. On an `hsm` key, `dek` and `aad` may total at\nmost 8,176 bytes. Omit it, send `null`, or send `\"\"`, for\nnone.\n",
+                    "example": "dGVuYW50PWFjbWU7b2JqZWN0PTQy"
+                  }
+                }
+              },
+              "example": {}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The wrapped data key, and the data key itself if rypt\ngenerated it.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "wrapped"
+                  ],
+                  "properties": {
+                    "dek": {
+                      "type": "string",
+                      "format": "byte",
+                      "description": "The generated data key, base64 — present only when the\nrequest supplied no `dek`. A caller that sent one already\nhas it, so the field is absent from the body entirely\nrather than null.\n"
+                    },
+                    "wrapped": {
+                      "type": "string",
+                      "format": "byte",
+                      "description": "The wrapped data key, base64, to be stored next to the\npayload it protects and handed back to `unwrap`.\n"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/KeyPendingDeletion"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/unwrap": {
+      "post": {
+        "tags": [
+          "crypto"
+        ],
+        "operationId": "unwrap",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Unwrap a data key",
+        "description": "One metered operation.\n\nNever refused for billing: a tenant whose billing has lapsed can\nstill unwrap every data key it wrapped. Refused, like every operation,\non a key pending deletion: restore the key to use it.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "wrapped"
+                ],
+                "properties": {
+                  "wrapped": {
+                    "type": "string",
+                    "format": "byte",
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "A `wrap` response's `wrapped` value, base64.",
+                    "example": "CiQAWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWG"
+                  },
+                  "aad": {
+                    "type": "string",
+                    "nullable": true,
+                    "format": "byte",
+                    "maxLength": 87384,
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "The same additional authenticated data the data key was\nwrapped with, standard padded base64. Omit it, send `null`,\nor send `\"\"`, when none was used.\n",
+                    "example": "dGVuYW50PWFjbWU7b2JqZWN0PTQy"
+                  }
+                }
+              },
+              "example": {
+                "wrapped": "CiQAWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWG"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The recovered data key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "dek"
+                  ],
+                  "properties": {
+                    "dek": {
+                      "type": "string",
+                      "format": "byte",
+                      "description": "The recovered data key, base64."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/KeyPendingDeletion"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/rewrap": {
+      "post": {
+        "tags": [
+          "crypto"
+        ],
+        "operationId": "rewrap",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Re-encrypt a ciphertext under the current primary version",
+        "description": "Decrypts under whatever version the ciphertext names and re-encrypts\nunder the current primary, without the plaintext leaving the process.\nOne metered operation despite the two KMS calls.\n\nOn a paid key, where the deployment configures billing, this is\n`402 billing_required` while the tenant's billing is not in good\nstanding, as `encrypt` is: it produces new ciphertext. A tenant in\nthat state can still `decrypt` what it has.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ciphertext"
+                ],
+                "properties": {
+                  "ciphertext": {
+                    "type": "string",
+                    "format": "byte",
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "A ciphertext this key produced, standard padded\nbase64.\n",
+                    "example": "CiQALS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZ"
+                  },
+                  "aad": {
+                    "type": "string",
+                    "nullable": true,
+                    "format": "byte",
+                    "maxLength": 87384,
+                    "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+                    "description": "The same additional authenticated data the ciphertext was\nmade with; it is reapplied to the new ciphertext. Omit it,\nsend `null`, or send `\"\"`, when none was used.\n",
+                    "example": "dGVuYW50PWFjbWU7dGFibGU9dXNlcnM="
+                  }
+                }
+              },
+              "example": {
+                "ciphertext": "CiQALS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZ"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The re-encrypted ciphertext.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CiphertextResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "402": {
+            "$ref": "#/components/responses/PaymentRequired"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/KeyPendingDeletion"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/keys/{id}/audit": {
+      "get": {
+        "tags": [
+          "audit"
+        ],
+        "operationId": "listAuditEvents",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Read a key's audit log",
+        "description": "Events newest first, for a key the tenant owns, keys pending deletion\nand destroyed keys included.\nNot metered, not audited: looking at the log must not grow it.\n\nEvery operation that changes the key or uses its material is an event,\nsuccessful or not. That includes an API token refused one of them: an\naction it was not given is the operation with `result` `error` and\n`error_code` `action_not_allowed`, and a key outside its `key_ids` is\nthe same with `key_not_allowed`. Every refusal is its own event. A\nrefusal about a key that is not a live key of the API token's own\ncontainer records nothing, and neither does a firewall refusal or a\nbad credential.\n\nThe window is half-open — `since` inclusive, `until` exclusive — and\n`ts` is rendered to microseconds, so a returned `ts` round-trips\nexactly as a bound. `since`/`until` select a window rather than acting\nas a lossless cursor, so choose a `limit` that covers the window you\nask for.\n\nA parameter that is present but empty is a value like any other and is\nrejected; only an absent parameter takes its default.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Key id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Oldest timestamp to include, RFC 3339 with an offset.\nInclusive.\n",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "example": "2026-09-01T00:00:00Z"
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "description": "Timestamp to stop before, RFC 3339 with an offset. Exclusive.\n",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "example": "2026-10-01T00:00:00Z"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "How many events to return. Defaults to 100.",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 100
+            },
+            "example": 50
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The key's audit events, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuditEvent"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/usage": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "operationId": "getUsage",
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "consoleAuth": []
+          }
+        ],
+        "summary": "Read the monthly usage report",
+        "description": "One line per live key, pending deletion or not — zeros when it did\nnothing — plus any destroyed key that performed operations in the\nperiod. An API token sees its container's lines, and one restricted to\nparticular keys only theirs. Not metered, not audited: looking at the\nreport must not change it.\n\nThe window is the calendar month in UTC. A `period` that is present but\nempty is rejected; only an absent `period` takes the default.\n",
+        "parameters": [
+          {
+            "name": "period",
+            "in": "query",
+            "required": false,
+            "description": "Month to report on. Defaults to the current UTC month.",
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d{4}-(0[1-9]|1[0-2])$"
+            },
+            "example": "2026-09"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One line per key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UsageLine"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "getMe",
+        "summary": "Read the signed-in user and the tenant they act as",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Who this console session belongs to, and which tenant every other\nendpoint will scope it to. The first request from an Auth0 subject this\nservice has not seen provisions a user, a tenant and an owner\nmembership; every later one is a read.\n\n`email` and `name` are what the access token carried. Auth0 puts neither\nin an access token by default, so both are null unless an Action adds\nthem — a dashboard that wants a profile to display already has one, in\nthe ID token Auth0 gave the browser.\n\nThe Auth0 `sub` is deliberately not returned. `user.id` is the\nidentifier that appears in this API's own audit log.\n",
+        "responses": {
+          "200": {
+            "description": "The session's user, tenant and role.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/api-tokens": {
+      "post": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "createApiToken",
+        "summary": "Issue an API token",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Mints an API token for the session's tenant and returns its token\n**once**. The token is not stored and cannot be recovered: the database\nholds only its Argon2id hash. Store it before leaving the response.\n\nIt lives in `container_id`, or the tenant's default container when\nthat is absent, for good: `400 invalid_container` for one that is not a\nlive container of the tenant's.\n\n`allowed_actions` is what it may do with the keys of its container.\nAbsent is none, and none allows nothing. Its creation is appended to\nthe container's permission chain, and the response carries the chain's\nnew head. On `encrypt`, `decrypt`, `wrap`, `unwrap`, `rewrap` and\n`rotate`, renaming, deleting and restoring a key, and creating one, an\naction the key was not given is `403 action_not_allowed`. `create`\nworks only for a key with no `key_ids`.\n\nAn API token may not call this. A key that could issue its successor\nwould outlive its own revocation, so revoking a leaked one would no\nlonger contain it.\n",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "container_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "The container it lives in and never sees outside of, or the\ntenant's default when absent.\n"
+                  },
+                  "allowed_actions": {
+                    "$ref": "#/components/schemas/AllowedActions"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$",
+                    "description": "Label for the key. Required: the listing carries no prefix,\nso this is the only thing that distinguishes two of a\ntenant's keys — and the endpoint you would reach for\nwithout it is the one that revokes them. Not only\nwhitespace, which the pattern cannot express.\n",
+                    "example": "production"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The new key, with its one-time token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedApiToken"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "listApiTokens",
+        "summary": "List the tenant's API tokens",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Every key this tenant has, newest first, revoked ones included — a\nrevoked key that vanished would take with it the explanation for its own\naudit trail.\n\nNever the token, never the hash, and deliberately never the prefix: the\nper-key rate limit is charged on the prefix lookup, before the Argon2\nverification, so a prefix alone drains that key's budget. `name` is what\ntells two keys apart, which is why it is required at creation.\n",
+        "responses": {
+          "200": {
+            "description": "One entry per key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiToken"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/api-tokens/{id}": {
+      "patch": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "updateApiToken",
+        "summary": "Restrict an API token",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Holds an API token to a firewall, to particular keys, or both, or lifts\neither, sets what it may do with those keys, and returns the key. All\nof these come from the key's own container. Each restriction has three\nstates: absent leaves that restriction as it is, `null` lifts it, and a\nvalue replaces it. An empty key list is `400`: a key allowed on nothing\nis a revoked key, and revoking says so. `allowed_actions` is absent or\na list, which may be empty; `null` is `400 invalid_allowed_actions`. An\nunknown field is `400 invalid_request` rather than ignored, so a\nmisspelt one cannot leave a key unrestricted while answering 200.\n\nA change to `key_ids` or `allowed_actions` is appended to the\ncontainer's permission chain in the same transaction, and the response\ncarries the chain's head after the request, moved or not. A change to\nthe firewall alone is not appended.\n\nEither applies from the key's very next request, because it is read in\nthe same lookup that finds the key. A key used from outside its\nfirewall's networks is `403 ip_not_allowed`; one used on a key outside\n`key_ids` is `403 key_not_allowed`, cannot create keys, and lists only\nits own keys and their usage. A key named in `key_ids` and later\ndestroyed stays named and allows nothing, so a key never widens to its\nwhole container when its last one goes. A firewall refusal is logged,\nnot audited. A `key_not_allowed` refusal of an operation the audit log\nrecords, and an `action_not_allowed` one, is audited as that operation\nwith `result` `error`: for a create always, and otherwise when the key\nis a live key of the API token's own container.\n\nConsole only: a key that could lift its own restrictions would not be\nrestricted by them. A revoked key, another tenant's, and an id never\nissued are the same 404, unaudited. Every other request that changes\nsomething, or is refused, is audited as `update_api_token`; one that\nchanges nothing answers the same 200 and writes no row.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The API token's id, as `GET /v1/api-tokens` reports it.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "firewall_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "nullable": true,
+                    "description": "A live firewall of the key's container; another\ncontainer's, a deleted one and an unknown id are\n`400 invalid_firewall`. `null` holds it to none.\n",
+                    "example": "4c3b2a19-0817-4f6e-9d5c-3b2a19081726"
+                  },
+                  "key_ids": {
+                    "type": "array",
+                    "nullable": true,
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "description": "Keys of the API token's container it may act on, each a live\none; one pending deletion counts, a destroyed one does not,\nand another container's is `400 invalid_key_ids`. Repeats\nare dropped, and the list is stored sorted. `null` allows\nevery key of its container.\n",
+                    "example": [
+                      "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+                    ]
+                  },
+                  "allowed_actions": {
+                    "$ref": "#/components/schemas/AllowedActions"
+                  }
+                }
+              },
+              "example": {
+                "firewall_id": "4c3b2a19-0817-4f6e-9d5c-3b2a19081726",
+                "key_ids": [
+                  "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+                ],
+                "allowed_actions": [
+                  "decrypt"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The API token, restricted as it now is, and the head of its\ncontainer's permission chain.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdatedApiToken"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "revokeApiToken",
+        "summary": "Revoke an API token",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Revocation takes effect on the very next request the key makes: the\nprefix lookup runs every time, so nothing is cached that could keep a\nrevoked key working.\n\nIdempotent — a key that was already revoked is still 204, because the\nstate the caller asked for is the state that holds. A key belonging to\nanother tenant and an id that was never issued are the same 404.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The API token's id, as `GET /v1/api-tokens` reports it.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The key is revoked."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/containers": {
+      "get": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "listContainers",
+        "summary": "List containers",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "The tenant's live containers, the default first and the rest oldest\nfirst. Not audited.\n",
+        "responses": {
+          "200": {
+            "description": "The tenant's containers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Container"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "createContainer",
+        "summary": "Create a container",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Makes an empty container. Its name has a key name's rules and is\nunique among the tenant's live containers: `409 container_exists`\notherwise. Every attempt is audited as `create_container`.\n",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$",
+                    "description": "Unique among the tenant's live containers.",
+                    "example": "staging"
+                  }
+                }
+              },
+              "example": {
+                "name": "staging"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The new container.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Container"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "`container_exists`: the tenant has a live container with that name.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/containers/{id}": {
+      "patch": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "renameContainer",
+        "summary": "Rename a container",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Renames a container, the default included. A name another live\ncontainer holds is `409 container_exists`. Renaming to the name it has\nchanges nothing, answers the same and writes no audit row; every other\nattempt is audited as `rename_container`. Another tenant's container,\na deleted one and an id never issued are the same 404, unaudited.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The container's id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "3e2d1c0b-9a87-4654-b321-0fedcba98765"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$",
+                    "description": "Unique among the tenant's live containers.",
+                    "example": "production"
+                  }
+                }
+              },
+              "example": {
+                "name": "production"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The container, renamed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Container"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`container_exists`: the tenant has another live container with that\nname.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "deleteContainer",
+        "summary": "Delete a container",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Deletes an empty container that is not the default. Nothing that\nlives in it may remain: a key, one pending deletion included, a live\nAPI token, or a firewall. A destroyed key and a revoked API token do not\ncount. Its name is free again at once. Refusals are audited as\n`delete_container`; another tenant's container, a deleted one and an\nid never issued are the same 404, unaudited.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The container's id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "3e2d1c0b-9a87-4654-b321-0fedcba98765"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. No body."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`container_is_default`: the default container cannot be deleted; or\n`container_not_empty`: it still holds keys, live API tokens or\nfirewalls, which the message counts.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/containers/{id}/permission-chain": {
+      "get": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "getPermissionChain",
+        "summary": "Read the head of a container's permission chain",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Every change to what a container's API tokens may do is appended to the\ncontainer's permission chain, each entry naming the SHA-256 hash of the\none before it. The latest entry's hash, the head, stands for the whole\nhistory: kept somewhere this service cannot reach, it is what a\nrewritten history would fail to match.\n\nThe first read of a container's head may start its chain, which writes\nits first entries; every later read only reads. Another tenant's\ncontainer, a deleted one and an id never issued are the same 404.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The container's id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "3e2d1c0b-9a87-4654-b321-0fedcba98765"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The chain's head.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionChain"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/firewalls": {
+      "get": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "listFirewalls",
+        "summary": "List firewalls",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "The tenant's live firewalls, every container's, oldest first. Each\nnames its container. Not audited.\n",
+        "responses": {
+          "200": {
+            "description": "The tenant's firewalls.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Firewall"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "createFirewall",
+        "summary": "Create a firewall",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Makes a firewall in `container_id`, or the tenant's default container\nwhen absent: `400 invalid_container` for one that is not a live\ncontainer of the tenant's. Its name has a key name's rules and is\nunique among its container's firewalls (`409 firewall_exists`). Hold\nAPI tokens of that container to it with `PATCH /v1/api-tokens/{id}`.\nEvery attempt is audited as `create_firewall`.\n",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "allowed_ips"
+                ],
+                "properties": {
+                  "container_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "The container it goes in; the default when absent."
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$",
+                    "description": "Unique among its container's live firewalls.",
+                    "example": "office"
+                  },
+                  "allowed_ips": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {
+                      "type": "string",
+                      "maxLength": 43
+                    },
+                    "description": "Networks a request presenting one of its API tokens may come\nfrom: an address, which allows that address alone, or a\nnetwork in CIDR notation. `0.0.0.0/0` and `::/0` allow a\nwhole address family. Refused with `400\ninvalid_allowed_ips`: a network with bits set past its\nprefix (`203.0.113.5/24`), an IPv4 address written as IPv6\n(`::ffff:203.0.113.5`), and surrounding whitespace. Repeats\nare dropped, and the list is stored sorted.\n",
+                    "example": [
+                      "203.0.113.0/24",
+                      "2001:db8::/32"
+                    ]
+                  }
+                }
+              },
+              "example": {
+                "name": "office",
+                "allowed_ips": [
+                  "203.0.113.0/24",
+                  "2001:db8::/32"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The new firewall.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Firewall"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "`firewall_exists`: its container has a live firewall with that name.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/firewalls/{id}": {
+      "patch": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "updateFirewall",
+        "summary": "Change a firewall",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Renames a firewall, replaces its networks, or both; a field left out\nstays as it was, and an unknown one is `400 invalid_request`. New\nnetworks apply to every API token held to it from their next request. A\nchange that changes nothing answers the same and writes no audit row;\nevery other attempt is audited as `update_firewall`. Another tenant's\nfirewall, a deleted one and an id never issued are the same 404,\nunaudited.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The firewall's id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "4c3b2a19-0817-4f6e-9d5c-3b2a19081726"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$",
+                    "description": "Unique among its container's live firewalls.",
+                    "example": "head-office"
+                  },
+                  "allowed_ips": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {
+                      "type": "string",
+                      "maxLength": 43
+                    },
+                    "description": "A new list of networks, replacing the old one, checked as at\ncreation.\n",
+                    "example": [
+                      "198.51.100.0/24"
+                    ]
+                  }
+                }
+              },
+              "example": {
+                "allowed_ips": [
+                  "198.51.100.0/24"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The firewall as it now is.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Firewall"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`firewall_exists`: its container has another live firewall with that\nname.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "deleteFirewall",
+        "summary": "Delete a firewall",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Deletes a firewall that no live API token is held to. Deleting one from\nunder its keys would leave them usable from anywhere, so that is\n`409 firewall_in_use`, which counts them: lift it from each with\n`PATCH /v1/api-tokens/{id}` first. A revoked key does not count. Audited\nas `delete_firewall`, a refusal included; another tenant's firewall, a\ndeleted one and an id never issued are the same 404, unaudited.\n",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The firewall's id.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "example": "4c3b2a19-0817-4f6e-9d5c-3b2a19081726"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted. No body."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`firewall_in_use`: live API tokens are held to it.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/billing": {
+      "get": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "getBilling",
+        "summary": "Read the tenant's billing standing and this month's estimate",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Where the tenant's billing stands, and what the current UTC month's\npaid keys and overage come to so far. Everything here is read from\nrypt's own database — the standing is what Stripe's webhook last\ndelivered, the estimate is computed from the tenant's keys and usage\n— so reading it never waits on Stripe.\n\nThe estimate is before tax, and is only an estimate: the invoice Stripe\nissues once the month has closed is the bill. In the month a\nsubscription starts, or starts again after one lapsed, the tenant's\npaid keys are billed for every day of that month they existed, the days\nbefore the subscription included — a whole key-month each, in a month\nbefore October 2026 — as they are counted here; overage from before the\ntenant's first subscription in the month is counted here too, but is\nnever billed; after a lapse within the month, the overage in between is\nbilled. Earlier months without a subscription are never billed.\n\nFrom October 2026 a paid key's fee is counted for its days so far,\nthrough today, so it grows by a day's share each day the key is kept,\nand never for fewer days than have already been sent to Stripe. Its\nallowance is its share for its days to the month's last, or to the day\nits deletion was requested if it was, so the overage is what the\ninvoice will say if nothing changes. A key still pending deletion is\ncounted as if it will not be restored; Stripe is told so only once the\nmonth has closed, since a restore would undo it, so until then the\noverage here can be ahead of what has been sent.\n\nIn a month before October 2026, a paid key less than a day old is\ncounted, unless it was created on the month's last day, and drops out\nif it is deleted before it is a day old. A key-month already sent to\nStripe is counted whatever the rules say of it now.\n\nNot metered, not audited: reading billing changes nothing.\n\nExists only where the deployment configures billing. Elsewhere this\npath is `404 not_found`, which is how a client tells that billing is\nswitched off rather than broken.\n",
+        "responses": {
+          "200": {
+            "description": "The tenant's standing and this month's estimate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Billing"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/billing/checkout": {
+      "post": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "createCheckoutSession",
+        "summary": "Start a subscription on Stripe Checkout",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Creates a Stripe Checkout session for the tenant's subscription and\nreturns its URL, for the dashboard to send the browser to. The card,\nbilling address and tax id are entered on Stripe's page and never\npass through rypt. The first call also creates the tenant's Stripe\ncustomer, and every later one reuses it — a lapsed tenant coming back\nincluded. Two first calls at once make one customer between them:\nthe second, arriving while the first is still creating it, is\n`503 unavailable`, and trying again gets that customer.\n\nStripe sends the browser back to the deployment's billing return URL\n(`RYPT_BILLING_RETURN_URL`) — with `?checkout=done` appended once the\ncustomer completes the page, unchanged if they turn back instead.\nComing back proves nothing by itself: the subscription reaches rypt\nthrough Stripe's webhook, usually within seconds, so\n`GET /v1/billing` can still say `none` for a moment after\n`checkout=done`.\n\nEach call makes a new session, whose URL Stripe keeps open for 24\nhours; follow it at once rather than storing it. A tenant whose\nsubscription is still open — `active`, `past_due` while Stripe\nretries a payment, or `unpaid` once the retries ran out — is\n`409 billing_active`, because a second subscription would bill every\nkey twice; the portal is where it changes its card or pays the open\ninvoice.\n\nStripe not answering, answering with a 5xx or a 429, or answering\n409 because another request is still creating the tenant's customer,\nis `503 unavailable`: try again in a moment. Any other failure is\n`500 internal_error` — among them a Stripe account the operator has\nnot yet prepared with `rypt-admin stripe setup`, which is found before\na customer is created, so nothing is left behind.\n\nTakes no request body. Not audited: it changes nothing a key or a\ncredential depends on, and the subscription it leads to arrives by\nwebhook. Exists only where the deployment configures billing, and is\n`404 not_found` elsewhere.\n",
+        "responses": {
+          "200": {
+            "description": "The Checkout page to send the browser to.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BillingSession"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`billing_active`: the tenant already has an open subscription\n(`active`, `past_due` or `unpaid`), so there is nothing to set up.\nManage it, or pay its open invoice, through\n`POST /v1/billing/portal`.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/billing/portal": {
+      "post": {
+        "tags": [
+          "console"
+        ],
+        "operationId": "createPortalSession",
+        "summary": "Open the Stripe customer portal",
+        "security": [
+          {
+            "consoleAuth": []
+          }
+        ],
+        "description": "Creates a Stripe customer portal session and returns its URL, for the\ndashboard to send the browser to. Invoices, the payment method, the\nbilling address, the tax id and cancellation all live there, on\nStripe's page, rather than being rebuilt here. The portal's way back\nleads to the deployment's billing return URL\n(`RYPT_BILLING_RETURN_URL`).\n\nStripe expires the URL five minutes after it is made unless it is\nused, so follow it at once. A cancellation made in the portal takes\neffect at the end of the billing period; once Stripe's webhook has\ndelivered it, `GET /v1/billing` shows the date as `cancel_at`.\n\nOpen to a tenant in any standing that has a Stripe customer, a\nlapsed one included: it may still have invoices to read or to pay. A\ntenant that has never started a checkout has no Stripe customer and\nnothing to manage: `409 billing_not_set_up`. Stripe failures are\n`503` or `500` as for `POST /v1/billing/checkout`.\n\nTakes no request body. Not audited, for the same reason as\n`POST /v1/billing/checkout`. Exists only where the deployment\nconfigures billing, and is `404 not_found` elsewhere.\n",
+        "responses": {
+          "200": {
+            "description": "The portal page to send the browser to.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BillingSession"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "`billing_not_set_up`: the tenant has no Stripe customer yet. Set\nbilling up through `POST /v1/billing/checkout` first.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/stripe/webhook": {
+      "post": {
+        "tags": [
+          "billing"
+        ],
+        "operationId": "stripeWebhook",
+        "summary": "Receive an event from Stripe",
+        "security": [],
+        "description": "Stripe calls this; clients never do. It is how rypt learns that a\nsubscription started, changed, fell behind on payment or ended — the\nconsole endpoints never ask Stripe for the standing, so this is the\nonly way it changes.\n\nIt takes no credential. Each delivery is authenticated instead by its\n`Stripe-Signature` header: an HMAC-SHA256, under the endpoint's\nsigning secret, of the timestamp and the exact bytes of the body. A\nmissing or non-matching signature, or a timestamp more than five\nminutes old, is `400 invalid_request`, and nothing in the body is\nacted on. So is a signed body that is not a JSON object, or an event\nwithout the `id`, `type` and `data` every event has. A body over\n128 KiB is `413 payload_too_large`, as on every route.\n\nAn event counts only through the subscription it names, which is\nfetched afresh from Stripe, so events that arrive late, out of order\nor twice all settle on Stripe's current state. A delivery that finds\nthe tenant's account changed by another while it was fetching applies\nnothing and fetches again — what every checkout's pair of events at\nonce meets — and only an account that changes under it three times\nrunning is `500`, so that Stripe redelivers it. An event already handled, one of a type rypt\ndoes not act on, one for a customer rypt does not know, and a thin\nnotification rather than a snapshot event are all `200`, because a\nretry could not change them. So is one naming a subscription Stripe\nno longer has, in test mode; in live mode, where Stripe never deletes\na subscription, that means the deployment's secret key is for another\naccount or mode, and it is `500` so that Stripe retries until the key\nis put right. A database or Stripe failure is `500`, which Stripe\nretries.\n\nExists only where the deployment configures billing, and is\n`404 not_found` elsewhere.\n",
+        "parameters": [
+          {
+            "name": "Stripe-Signature",
+            "in": "header",
+            "required": true,
+            "description": "`t=<unix seconds>,v1=<hex HMAC>`, with one `v1` per active\nsigning secret while a secret is being rolled; any match is\naccepted.\n",
+            "schema": {
+              "type": "string"
+            },
+            "example": "t=1790000000,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A Stripe event, in the API version the endpoint was created\nwith. Deliberately unconstrained: Stripe's event shapes are\nStripe's to extend, and the signature, not this schema, is\nwhat vouches for the body.\n"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Received — acted on now or before, or not needed. No body."
+          },
+          "400": {
+            "description": "`invalid_request`. The `Stripe-Signature` header is missing,\nmalformed, too old or matches no signature, or a signed body is\nnot a JSON object or not an event.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "description": "`internal_error`. Nothing was applied and the event is not\nrecorded, so Stripe delivers it again: a database or Stripe\nfailure, a failed cancellation of a subscription the event makes\nredundant, the tenant's account changed by another delivery while\nthis one fetched the subscription, or — in live mode only — a\nsubscription Stripe does not have. The cause is logged and never\nreturned.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "operationId": "healthzV1",
+        "summary": "Liveness",
+        "description": "No authentication, no database call, no KMS call: it answers whether\nthis process is up and serving.\n",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The process is serving.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "operationId": "healthzRoot",
+        "summary": "Liveness, at the root",
+        "description": "The same handler as `/v1/healthz`. In the Cloud Run deployment Google's\nfrontend answers the root path itself, so a request here never reaches\nthe container; `/v1/healthz` is the one to probe in production.\n",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The process is serving.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "`Authorization: Bearer ry_<prefix>_<secret>` — 44 characters: `ry_`, an\n8-character prefix, `_`, a 32-character secret, all base62. Issued by\n`rypt-admin apikey create` or by `POST /v1/api-tokens`, and shown once.\n"
+      },
+      "consoleAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "`Authorization: Bearer <Auth0 access token>` — an RS256 JWT issued by\nthe operator's Auth0 tenant for this API's audience. Used by the\ndashboard; a browser cannot hold an API token.\n\nServed only when the deployment configures a console. Where it is\noffered alongside `bearerAuth`, either credential is accepted and both\nresolve to the same tenant.\n"
+      }
+    },
+    "schemas": {
+      "Container": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "is_default",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Used in `/v1/containers/{id}`, and as `container_id` elsewhere."
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique among the tenant's live containers."
+          },
+          "is_default": {
+            "type": "boolean",
+            "description": "The tenant's default container: there is exactly one, everything\ngoes in it unless told otherwise, and it cannot be deleted.\n"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 in UTC, to microseconds."
+          }
+        },
+        "example": {
+          "id": "3e2d1c0b-9a87-4654-b321-0fedcba98765",
+          "name": "Default",
+          "is_default": true,
+          "created_at": "2026-09-16T10:00:00.123456Z"
+        }
+      },
+      "Firewall": {
+        "type": "object",
+        "required": [
+          "id",
+          "container_id",
+          "name",
+          "allowed_ips",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Used in `/v1/firewalls/{id}`, and as an API token's `firewall_id`."
+          },
+          "container_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The container it lives in. Only that container's API tokens can be\nheld to it.\n"
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique among its container's live firewalls."
+          },
+          "allowed_ips": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Networks in CIDR notation (an address alone is `/32` or `/128`),\nascending.\n"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 in UTC, to microseconds."
+          }
+        },
+        "example": {
+          "id": "4c3b2a19-0817-4f6e-9d5c-3b2a19081726",
+          "container_id": "3e2d1c0b-9a87-4654-b321-0fedcba98765",
+          "name": "office",
+          "allowed_ips": [
+            "203.0.113.0/24",
+            "2001:db8::/32"
+          ],
+          "created_at": "2026-09-16T10:00:00.123456Z"
+        }
+      },
+      "Key": {
+        "type": "object",
+        "required": [
+          "id",
+          "container_id",
+          "name",
+          "tier",
+          "versions",
+          "primary_version",
+          "retiring_versions",
+          "created_at",
+          "state",
+          "delete_requested_at",
+          "destroy_after"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Key id, used in every `/v1/keys/{id}` path."
+          },
+          "container_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The container it lives in, fixed at creation."
+          },
+          "name": {
+            "type": "string",
+            "description": "Tenant-chosen name, unique among its container's live keys."
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "free",
+              "wrapped",
+              "software",
+              "hsm"
+            ],
+            "description": "Fixed at creation."
+          },
+          "versions": {
+            "type": "array",
+            "description": "Short ids of the key's enabled versions, ascending: every version\nthat still decrypts, the retiring ones included.\n",
+            "items": {
+              "type": "string"
+            }
+          },
+          "primary_version": {
+            "type": "string",
+            "description": "Short id of the version new ciphertext is produced under. Always one\nof `versions`, and never retiring.\n"
+          },
+          "retiring_versions": {
+            "type": "array",
+            "description": "The versions a rotation retired, ascending, each with the time it\nis destroyed. Each is also in `versions`. Empty when none is\nretiring.\n",
+            "items": {
+              "$ref": "#/components/schemas/RetiringVersion"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 in UTC, to microseconds."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "active",
+              "pending_deletion"
+            ],
+            "description": "`active`, or `pending_deletion`: deleted, not yet destroyed, and\nrefusing every operation until it is restored.\n"
+          },
+          "delete_requested_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When deletion was requested, RFC 3339 in UTC, to microseconds.\nNull unless the key is pending deletion.\n"
+          },
+          "destroy_after": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When a key pending deletion is destroyed, unless it is restored\nfirst: seven days after `delete_requested_at`. From this time on\nit can no longer be restored. The destruction happens at the\nservice's first sweep after it, so the key may still be listed as\npending for a while, longer when the service has been idle. Null\nunless the key is pending deletion.\n"
+          }
+        },
+        "example": {
+          "id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+          "name": "prod-database",
+          "tier": "software",
+          "versions": [
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "primary_version": "4",
+          "retiring_versions": [
+            {
+              "version": "1",
+              "destroy_after": "2026-10-21T09:15:00.250000Z"
+            }
+          ],
+          "created_at": "2026-09-16T10:00:00.123456Z",
+          "state": "active",
+          "delete_requested_at": null,
+          "destroy_after": null
+        }
+      },
+      "RetiringVersion": {
+        "type": "object",
+        "required": [
+          "version",
+          "destroy_after"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "description": "Short id of the version."
+          },
+          "destroy_after": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the version is destroyed: seven days after the rotation that\nretired it, RFC 3339 in UTC, to microseconds. Until then it\ndecrypts, unwraps and rewraps; from the service's first sweep after\nit, it never will again. The sweep runs every few minutes, later\nwhen the service has been idle, so the version may still be listed\nfor a while after this time.\n"
+          }
+        }
+      },
+      "CiphertextResponse": {
+        "type": "object",
+        "required": [
+          "ciphertext"
+        ],
+        "properties": {
+          "ciphertext": {
+            "type": "string",
+            "format": "byte",
+            "description": "The ciphertext, base64. It names the key version it was made under,\nso `decrypt` keeps working across rotations.\n"
+          }
+        }
+      },
+      "AuditEvent": {
+        "type": "object",
+        "required": [
+          "id",
+          "ts",
+          "key_id",
+          "api_token_id",
+          "user_id",
+          "op",
+          "kms_version",
+          "result",
+          "error_code",
+          "request_id",
+          "src_ip",
+          "bytes",
+          "kms_us"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonic event id."
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 in UTC, to microseconds."
+          },
+          "key_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Key the operation was on. Null on a failed `create_key`, whose row\nwas rolled back or never inserted.\n"
+          },
+          "api_token_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "API token the request presented. Null for an operation performed\nfrom the console, which presents an Auth0 access token instead.\n"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Console user the request authenticated as. Null for an operation\nperformed with an API token. Exactly one of this and `api_token_id`\nis set on every event a request caused since the console existed;\nboth are null on older rows, on the `destroy_key` the service\nrecords when it destroys a key whose pending deletion ran out, and\non the `destroy_version` it records when it destroys a version whose\nseven days after a rotation ran out.\n"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "create_key",
+              "rename_key",
+              "delete_key",
+              "restore_key",
+              "destroy_key",
+              "rotate",
+              "destroy_version",
+              "encrypt",
+              "decrypt",
+              "wrap",
+              "unwrap",
+              "rewrap",
+              "create_api_token",
+              "update_api_token",
+              "revoke_api_token",
+              "create_container",
+              "rename_container",
+              "delete_container",
+              "create_firewall",
+              "update_firewall",
+              "delete_firewall"
+            ],
+            "description": "Operation name. `rename_key` is a change of the key's name; the\nevent records neither name. `delete_key` is a deletion requested,\nwhich puts the key in pending deletion; `restore_key` takes it out\nagain; and `destroy_key` is its destruction, by delete now or, with\nno API token, user or address, by the service once the pending\ndeletion ran out. `destroy_version` is the destruction of one\nversion a rotation retired, by the service once its seven days ran\nout, with no API key, user or address; `kms_version` names the\nversion. `create_api_token`, `update_api_token` and\n`revoke_api_token`, and the container and firewall operations, are\nrecorded with no `key_id`, so this endpoint — which reads one key's\nhistory — never returns them.\n"
+          },
+          "kms_version": {
+            "type": "string",
+            "nullable": true,
+            "description": "Short KMS version id the operation used. For `decrypt` and `unwrap`\nit is the key's primary version if that is what the ciphertext\nnamed, and null otherwise. For `destroy_version`, the version\ndestroyed.\n"
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "error_code": {
+            "type": "string",
+            "nullable": true,
+            "description": "The error envelope's code, for a failed operation. A refused one\nincluded: `action_not_allowed` for an action the API token was not\ngiven, `key_not_allowed` for a key outside its `key_ids`.\n"
+          },
+          "request_id": {
+            "type": "string",
+            "description": "The `x-request-id` of the request that caused the event, or, for a\n`destroy_key` or `destroy_version` the service recorded on its own,\nan id it made for the occasion.\n"
+          },
+          "src_ip": {
+            "type": "string",
+            "nullable": true,
+            "description": "The address the request came from. Null only on a `destroy_key` or\n`destroy_version` the service recorded on its own, which no request\ncaused.\n"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "description": "Size of the operation's input in bytes, never any content. Null\nwhen the request failed before its input was decoded.\n"
+          },
+          "kms_us": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0,
+            "nullable": true,
+            "description": "How long the key-management backend took, in microseconds: the one\ncall `encrypt`, `decrypt`, `wrap` and `unwrap` make, and both of\n`rewrap`'s. Recorded for a call that failed too. Null for every\nother operation, and for one refused before the backend was called.\n"
+          }
+        },
+        "example": {
+          "id": 42,
+          "ts": "2026-09-16T10:00:00.123456Z",
+          "key_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+          "api_token_id": "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
+          "user_id": null,
+          "op": "encrypt",
+          "kms_version": "3",
+          "result": "ok",
+          "error_code": null,
+          "request_id": "018f8a0e-2a4a-7b8e-9f1c-2f7a6d5c4b3a",
+          "src_ip": "10.0.0.7",
+          "bytes": 11,
+          "kms_us": 18342
+        }
+      },
+      "Me": {
+        "type": "object",
+        "required": [
+          "user",
+          "tenant",
+          "role"
+        ],
+        "properties": {
+          "user": {
+            "type": "object",
+            "required": [
+              "id",
+              "email",
+              "name",
+              "created_at"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Stable id for this person, and what `audit_events.user_id`\nrecords.\n"
+              },
+              "email": {
+                "type": "string",
+                "nullable": true,
+                "description": "The email the access token last carried, or null. Null on a\ndefault Auth0 setup, which puts no profile in an access token.\n"
+              },
+              "name": {
+                "type": "string",
+                "nullable": true,
+                "description": "As `email`."
+              },
+              "created_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "When they first authenticated. RFC 3339 in UTC."
+              }
+            }
+          },
+          "tenant": {
+            "type": "object",
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The tenant every other endpoint scopes this caller to."
+              },
+              "name": {
+                "type": "string",
+                "description": "For a tenant created at first login, the user's own email, or\ntheir Auth0 subject when the token carried no email.\n"
+              }
+            }
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "admin",
+              "member"
+            ],
+            "description": "The role held in that tenant. Every user today owns the one tenant\nthey were provisioned with; nothing yet grants a second membership.\n"
+          }
+        }
+      },
+      "ApiToken": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "created_by_user_id",
+          "created_at",
+          "revoked_at",
+          "container_id",
+          "firewall_id",
+          "key_ids",
+          "allowed_actions"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Used in `DELETE /v1/api-tokens/{id}`."
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "description": "The label it was created with. Null for a key made with\n`rypt-admin`, which has no person to name it.\n"
+          },
+          "created_by_user_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The console user who created it, if one did."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 in UTC, to microseconds."
+          },
+          "revoked_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When it was revoked, or null while it is live."
+          },
+          "container_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The container it lives in and never sees outside of."
+          },
+          "firewall_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The firewall it is held to, or null for none."
+          },
+          "key_ids": {
+            "type": "array",
+            "nullable": true,
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Keys of its container it may act on, ascending; null for all of\nthem. A key destroyed since it was named stays in the list.\n"
+          },
+          "allowed_actions": {
+            "$ref": "#/components/schemas/AllowedActions"
+          }
+        }
+      },
+      "UpdatedApiToken": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ApiToken"
+          },
+          {
+            "type": "object",
+            "required": [
+              "permission_chain_head"
+            ],
+            "properties": {
+              "permission_chain_head": {
+                "$ref": "#/components/schemas/ChainHead"
+              }
+            }
+          }
+        ]
+      },
+      "AllowedActions": {
+        "type": "array",
+        "maxItems": 11,
+        "items": {
+          "type": "string",
+          "enum": [
+            "create",
+            "decrypt",
+            "delete",
+            "encrypt",
+            "read",
+            "rename",
+            "restore",
+            "rewrap",
+            "rotate",
+            "unwrap",
+            "wrap"
+          ]
+        },
+        "description": "What an API token may do with the keys it may act on: `encrypt`,\n`decrypt`, `wrap`, `unwrap`, `rewrap` and `rotate` use a key or rotate\nit, `rename`, `delete` and `restore` change its lifecycle, and `create`\nmakes a new one in the key's container, for a key with no `key_ids`\nalone. `read` is for listing keys, reading a key and its audit log,\nand reading usage. Empty allows nothing. Repeats are dropped, and\nthe list is returned sorted. API tokens made before 0.8.0 were not\ngiven the four lifecycle actions; those that existed when 0.14.0\nwas deployed were given `read`.\n",
+        "example": [
+          "decrypt",
+          "encrypt"
+        ]
+      },
+      "ChainHead": {
+        "type": "object",
+        "required": [
+          "seq",
+          "hash"
+        ],
+        "description": "The latest entry of a container's permission chain.\n",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Its position; 0 is the chain's genesis entry."
+          },
+          "hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Its SHA-256 hash, lowercase hex, which covers the hash of the entry\nbefore it and so every entry back to genesis. The serialization is\nspecified in `crates/rypt-core/src/permissions.rs`.\n"
+          }
+        },
+        "example": {
+          "seq": 5,
+          "hash": "07d1c0ffee5e7c0de0ddba11ab1e5eedfacade0123456789abcdef0123456789"
+        }
+      },
+      "PermissionChain": {
+        "type": "object",
+        "required": [
+          "container_id",
+          "head"
+        ],
+        "properties": {
+          "container_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The container whose chain this is."
+          },
+          "head": {
+            "$ref": "#/components/schemas/ChainHead"
+          }
+        }
+      },
+      "CreatedApiToken": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "container_id",
+          "prefix",
+          "created_at",
+          "allowed_actions",
+          "permission_chain_head",
+          "token"
+        ],
+        "properties": {
+          "container_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The container it lives in and never sees outside of."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Used in `DELETE /v1/api-tokens/{id}`."
+          },
+          "name": {
+            "type": "string",
+            "nullable": true,
+            "description": "The label it was created with."
+          },
+          "prefix": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 8,
+            "description": "The token's 8-character lookup prefix. Returned here and nowhere\nelse; it gives nothing away, because it is already inside `token`.\n"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 in UTC, to microseconds."
+          },
+          "allowed_actions": {
+            "$ref": "#/components/schemas/AllowedActions"
+          },
+          "permission_chain_head": {
+            "$ref": "#/components/schemas/ChainHead"
+          },
+          "token": {
+            "type": "string",
+            "minLength": 44,
+            "maxLength": 44,
+            "description": "**The plaintext API token, returned exactly once.** Not stored and\nnot recoverable: the database holds only its Argon2id hash.\n",
+            "example": "ry_K3pQ7xTa_9fLm2Qd8xWv4Nc6Bz1Hs0Yt3Rk5Jp7Gq"
+          }
+        }
+      },
+      "UsageLine": {
+        "type": "object",
+        "required": [
+          "key_id",
+          "container_id",
+          "ops",
+          "overage_ops",
+          "cap",
+          "allowance"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "container_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The container the key lives in, so the line of a destroyed key,\nwhich no key listing carries any more, can still be placed.\n"
+          },
+          "ops": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Operations performed in the period, including any past the\nallowance.\n"
+          },
+          "overage_ops": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of those operations were past the key's `allowance`. On a\npaid tier this is the quantity overage is billed on: from October\n2026, `ops` less `allowance`, never below 0; in a month before,\ncounted operation by operation against the cap in force when each\nhappened. On `free`, which refuses new ciphertext at the cap\nrather than allowing overage, it counts the decrypts and unwraps\npast the cap, and the few operations concurrent requests can carry\npast it, none of which are ever billed.\n"
+          },
+          "cap": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The key tier's monthly cap: on `free` a hard limit on `encrypt`,\n`wrap` and `rewrap`, past which `decrypt` and `unwrap` go on, and\non the paid tiers the included allowance of a key that exists all\nmonth.\nAlways the tier's, whatever `allowance` says.\n"
+          },
+          "allowance": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The key's included operations for the period. It is `cap`, but for\na paid key in a month from October 2026, whose allowance is split\nby the day like its fee: `cap × days / days in the month`, rounded\ndown. Its days are the UTC days it exists in, from the day it was\ncreated, or the 1st, through the day its deletion was requested,\nif it was, or the month's last, both counted; so a key that exists\nfor 10 days of a 30-day month includes 10/30 of `cap`. A month\nthat has ended is not reopened: a key still pending deletion when\nit ended keeps, for that month, the share it was billed with, to\nthe day its deletion was requested, even if it has been restored\nsince.\n"
+          }
+        },
+        "example": {
+          "key_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+          "ops": 1234,
+          "overage_ops": 0,
+          "cap": 100000,
+          "allowance": 100000
+        }
+      },
+      "Billing": {
+        "type": "object",
+        "required": [
+          "status",
+          "period",
+          "cancel_at",
+          "estimate"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "none",
+              "active",
+              "past_due",
+              "unpaid",
+              "lapsed"
+            ],
+            "description": "Where the tenant's subscription stands, as Stripe's webhook last\ndelivered it. `none` — no subscription yet: never subscribed, or a\ncheckout started and not completed. `active` — in good\nstanding (Stripe's `active` or `trialing`). `past_due` — a payment\nfailed and Stripe is retrying it; still good standing, so nothing\nstops meanwhile, and the portal is where the card is fixed.\n`unpaid` — Stripe's retries ran out and the subscription is still\nopen with an unpaid invoice: paying it in the portal\n(`POST /v1/billing/portal`) restores good standing, and checkout\nis `409 billing_active`, because a second subscription beside the\nopen one would bill every key twice. `lapsed` — anything else:\ncancelled, paused or never completed; setting billing up again\nthrough `POST /v1/billing/checkout` restores it. Under `unpaid`\nand `lapsed`, paid keys still decrypt and unwrap, but `encrypt`,\n`wrap`, `rewrap` and creating a paid key are\n`402 billing_required`.\n"
+          },
+          "period": {
+            "type": "string",
+            "pattern": "^\\d{4}-(0[1-9]|1[0-2])$",
+            "description": "The UTC calendar month the estimate covers, always the current one.",
+            "example": "2026-09"
+          },
+          "cancel_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When the subscription is due to end, after a cancellation in the\nportal; null when no end is scheduled. Until then it bills and\nworks as before. Also null once the tenant is no longer in good\nstanding: `status` already says the subscription is over, and a\ndate in the past would read as an end still to come.\n"
+          },
+          "estimate": {
+            "$ref": "#/components/schemas/BillingEstimate"
+          }
+        },
+        "example": {
+          "status": "active",
+          "period": "2026-09",
+          "cancel_at": null,
+          "estimate": {
+            "currency": "usd",
+            "total_cents": 612,
+            "lines": [
+              {
+                "tier": "wrapped",
+                "key_months": 2,
+                "key_days": 60,
+                "days_in_period": 30,
+                "fee_cents": 300,
+                "overage_ops": 12345,
+                "overage_millicents_per_op": 1,
+                "fee_amount_cents": 600,
+                "overage_amount_cents": 12,
+                "amount_cents": 612
+              },
+              {
+                "tier": "software",
+                "key_months": 0,
+                "key_days": 0,
+                "days_in_period": 30,
+                "fee_cents": 1000,
+                "overage_ops": 0,
+                "overage_millicents_per_op": 2,
+                "fee_amount_cents": 0,
+                "overage_amount_cents": 0,
+                "amount_cents": 0
+              },
+              {
+                "tier": "hsm",
+                "key_months": 0,
+                "key_days": 0,
+                "days_in_period": 30,
+                "fee_cents": 3500,
+                "overage_ops": 0,
+                "overage_millicents_per_op": 5,
+                "fee_amount_cents": 0,
+                "overage_amount_cents": 0,
+                "amount_cents": 0
+              }
+            ]
+          }
+        }
+      },
+      "BillingEstimate": {
+        "type": "object",
+        "required": [
+          "currency",
+          "total_cents",
+          "lines"
+        ],
+        "description": "What the period's paid keys and their overage come to so far, before\ntax. The invoice Stripe issues after the month closes is the bill,\nwith any tax added.\n",
+        "properties": {
+          "currency": {
+            "type": "string",
+            "description": "ISO 4217 code, lower case, as Stripe writes it.",
+            "example": "usd"
+          },
+          "total_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The sum of every line's `amount_cents`."
+          },
+          "lines": {
+            "type": "array",
+            "description": "One line per paid tier — `wrapped`, `software`, `hsm`, in that\norder — whether or not the tenant has a key on it, so a price\nlist can be drawn from the lines alone.\n",
+            "items": {
+              "$ref": "#/components/schemas/BillingLine"
+            }
+          }
+        }
+      },
+      "BillingLine": {
+        "type": "object",
+        "required": [
+          "tier",
+          "key_months",
+          "key_days",
+          "days_in_period",
+          "fee_cents",
+          "overage_ops",
+          "overage_millicents_per_op",
+          "fee_amount_cents",
+          "overage_amount_cents",
+          "amount_cents"
+        ],
+        "properties": {
+          "tier": {
+            "type": "string",
+            "enum": [
+              "wrapped",
+              "software",
+              "hsm"
+            ],
+            "description": "A paid tier. `free` is never billed, so never listed."
+          },
+          "key_months": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The tenant's keys on this tier billed for the period. From October\n2026, every one billed at least one day of it so far. In a month\nbefore, every one that existed at any point in it — its deletion,\nif requested, not requested before the period began — except one\ndeleted within 24 hours of being created and not restored, and one\ncreated on the period's last day; each is one key-month, billed in\nfull.\n"
+          },
+          "key_days": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The days those keys are billed for so far, summed. A key's days\nare the UTC days it exists in, from the day it was created, or the\n1st, through today or the day its deletion was requested,\nwhichever is earlier, both counted, and never fewer than have\nalready been sent to Stripe. In a month before October 2026 a\nkey-month counts every day of the month, so `key_days` is\n`key_months × days_in_period`: in any month,\n`key_days / days_in_period` is the key-months the fee is for.\n"
+          },
+          "days_in_period": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many days the period's UTC month has, 28 to 31: what a paid\nkey's fee and allowance are split into from October 2026.\n"
+          },
+          "fee_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The tier's fee per key-month — one key for a whole month — in\ncents. From October 2026 a key pays its days over `days_in_period`\nof it.\n"
+          },
+          "overage_ops": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Operations beyond the included allowance, summed across this\ntier's keys for the period. From October 2026 each key's are its\noperations past its `allowance`, as `GET /v1/usage` gives it: a\nkey still pending deletion is counted as if it will not be\nrestored, which Stripe is told only once the month has closed.\n"
+          },
+          "overage_millicents_per_op": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The tier's price per overage operation, in thousandths of a cent.\nAn integer because the price is a fraction of a cent.\n"
+          },
+          "fee_amount_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the keys' fees come to, in cents, rounded half up to the cent\non its own, as Stripe rounds the tier's key-months line of the\ninvoice. In a month before October 2026 it is\n`key_months × fee_cents`. From then on it is `fee_cents` times the\nkeys' shares of a key-month, summed: each share is the key's days\nover `days_in_period`, rounded to nine decimal places as Stripe is\nsent it, so a key that exists all month pays exactly `fee_cents`,\nand `key_days / days_in_period × fee_cents` is this to within a\ncent.\n"
+          },
+          "overage_amount_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the overage comes to, in cents:\n`overage_ops × overage_millicents_per_op / 1000`, rounded half up\nto the cent on its own, as Stripe rounds the tier's overage line\nof the invoice.\n"
+          },
+          "amount_cents": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the line comes to: `fee_amount_cents` plus\n`overage_amount_cents`. Each is rounded before they are added,\nbecause Stripe rounds each invoice line, and a tier's fees are one\nline and its overage another; so half a cent of each comes to two\ncents, not one.\n"
+          }
+        }
+      },
+      "BillingSession": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "A Stripe-hosted page to send the browser to. Short-lived, and\nspecific to this tenant: follow it at once, never store it.\n",
+            "example": "https://checkout.stripe.com/c/pay/cs_test_a1b2c3"
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          }
+        },
+        "example": {
+          "status": "ok"
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error",
+          "message",
+          "request_id"
+        ],
+        "description": "Every error, from every layer, has this envelope. `cap` and `resets_at`\nare present only on `ops_cap_reached`.\n",
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "unauthorized",
+              "api_token_required",
+              "session_required",
+              "ip_not_allowed",
+              "key_not_allowed",
+              "action_not_allowed",
+              "no_tenant",
+              "not_found",
+              "method_not_allowed",
+              "invalid_request",
+              "invalid_base64",
+              "invalid_tier",
+              "invalid_name",
+              "invalid_dek_length",
+              "invalid_ciphertext",
+              "invalid_period",
+              "invalid_query",
+              "invalid_allowed_ips",
+              "invalid_key_ids",
+              "invalid_allowed_actions",
+              "invalid_container",
+              "invalid_firewall",
+              "billing_required",
+              "key_exists",
+              "free_key_exists",
+              "key_pending_deletion",
+              "too_many_retiring_versions",
+              "not_pending_deletion",
+              "restore_window_closed",
+              "container_exists",
+              "firewall_exists",
+              "container_not_empty",
+              "container_is_default",
+              "firewall_in_use",
+              "billing_active",
+              "billing_not_set_up",
+              "payload_too_large",
+              "unsupported_media_type",
+              "ops_cap_reached",
+              "rate_limited",
+              "internal_error",
+              "unavailable"
+            ],
+            "description": "Stable machine-readable code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable detail. Never names a GCP resource, a permission or\nan internal cause.\n"
+          },
+          "request_id": {
+            "type": "string",
+            "description": "The same value as the response's `x-request-id`."
+          },
+          "cap": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The tier's monthly cap. `ops_cap_reached` only."
+          },
+          "resets_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Midnight UTC on the first of the next month, when the counter\nresets. `ops_cap_reached` only.\n"
+          }
+        },
+        "example": {
+          "error": "not_found",
+          "message": "not found",
+          "request_id": "018f8a0e-2a4a-7b8e-9f1c-2f7a6d5c4b3a"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "`invalid_request`, `invalid_base64`, `invalid_tier`, `invalid_name`,\n`invalid_dek_length`, `invalid_ciphertext`, `invalid_period`,\n`invalid_query`, `invalid_allowed_ips`, `invalid_key_ids`,\n`invalid_allowed_actions`, `invalid_container` or `invalid_firewall`.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "`unauthorized`. A missing header, the wrong scheme, a malformed token,\nan unknown prefix, a revoked key and a wrong secret are all\nindistinguishable.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "PaymentRequired": {
+        "description": "`billing_required`. Only where the deployment configures billing,\nand only while the tenant's billing is not in good standing: no\nsubscription, or one that is cancelled, unpaid, paused or never\ncompleted. A payment Stripe is still retrying is good standing —\nnothing stops while it tries again.\n\nIt answers creating a key on a paid tier (`wrapped`, `software`,\n`hsm`), and `encrypt`, `wrap` and `rewrap` on a paid-tier key: the\noperations that start a new charge or produce new ciphertext. It\nalso answers `rotate` on a paid-tier key, because a rotation retires\nthe old version and a lapsed tenant could not rewrap off it before\nit is destroyed.\n`decrypt` and `unwrap` are never refused for billing, so a lapsed\ntenant can always recover its data, and a `free` key is unaffected.\nSetting billing up again in the console clears it.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The credential is valid but is the wrong kind for this endpoint:\n`api_token_required` on an endpoint an API token must reach, or\n`session_required` on one only a console session may. Also `no_tenant`,\nfor an authenticated user who belongs to no tenant; and, for an API\ntoken its owner restricted, `ip_not_allowed` from outside its firewall's\nnetworks — on any endpoint, naming the address — `key_not_allowed` for a\nkey outside its list, or a create, and `action_not_allowed` for\n`encrypt`, `decrypt`, `wrap`, `unwrap`, `rewrap` or `rotate`, a rename,\na delete, a restore, a create or a read (listing keys, reading a key or\nits audit log, reading usage) when it was not given that action. A\nrefused read is not recorded in the audit log.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "`not_found`. An unknown route, or a key id that is unknown, destroyed,\nnot a UUID, another tenant's, or — for an API token — another\ncontainer's: the API never confirms that an id exists. A key pending deletion is still found: it is not `404`, and\nit refuses operations with `409 key_pending_deletion`.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "KeyPendingDeletion": {
+        "description": "`key_pending_deletion`. The key is pending deletion: it refuses every\noperation, `decrypt` and `unwrap` included, until it is restored with\n`POST /v1/keys/{id}/restore`. The message says when it will be\ndestroyed. The refusal is audited, so the key's log shows what still\ntried to use it, and it is never counted.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "`payload_too_large`. A body over 128 KiB, a `plaintext` over 65,536\nbytes, an `aad` over 65,520 bytes on a `software` or `hsm` key (65,536\non a `free` or `wrapped` one), or an `hsm` key's `plaintext` (or\n`dek`) + `aad` over 8,176 bytes.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "UnsupportedMediaType": {
+        "description": "`unsupported_media_type`. A JSON body without\n`content-type: application/json`.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "`ops_cap_reached` — `encrypt`, `wrap`, `rewrap` or `rotate` on a\n`free` key at its monthly cap, carrying `cap` and `resets_at`;\n`decrypt` and `unwrap` are never refused at the cap — or\n`rate_limited`, over 100 requests per second for this API token.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "`internal_error`. A database failure, a KMS failure other than a bad\nciphertext, a Stripe failure, or a panic. The cause is logged with the\nrequest id and never returned.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "`unavailable`. A bounded internal queue was full for longer than its\nwait, or — on `POST /v1/billing/checkout` and\n`POST /v1/billing/portal` — Stripe did not answer, or answered with a\n5xx or a 429, or — on checkout — a 409 because another checkout for\nthe tenant was still creating its customer, or — on the ten routes an\nAPI token's actions govern — the policy decision point did not answer.\nNothing is wrong with the request; retry it.\n",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+# Local credentials for the integration tests. Never commit.
+.env
+.env.*
+
+# Test and coverage output
+*.test
+*.out
+/coverage.*
