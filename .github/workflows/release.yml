@@ -23,6 +23,17 @@ jobs:
           cache: false
       - run: make vet race
 
+      # A CycloneDX SBOM of the module: its version and the modules it
+      # requires. It is made before the release, so that a release never
+      # goes out without one.
+      - name: Make the SBOM
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0 \
+            mod -type library -json -licenses -assert-licenses -short-purls \
+            -output "rypt-${TAG}.cdx.json"
+
       # A tag with a pre-release suffix, such as v1.2.0-rc.1, is published
       # as a pre-release.
       - name: Publish the GitHub release
@@ -32,7 +43,8 @@ jobs:
         run: |
           prerelease=
           case "$TAG" in *-*) prerelease=--prerelease ;; esac
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $prerelease
+          gh release create "$TAG" "rypt-${TAG}.cdx.json" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes $prerelease
 
       # Ask the Go module proxy for the new version, so that it and
       # pkg.go.dev list it without waiting for someone to request it. The
