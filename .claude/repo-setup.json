@@ -1,0 +1,15 @@
+{
+  "rules_version": 1,
+  "claude_commits": true,
+  "config_in_git": true,
+  "github_config": true,
+  "repo_type": ["library"],
+  "languages": ["go"],
+  "check_command": "make check",
+  "sbom": true,
+  "default_branch": "main",
+  "taskd_project": "rypt",
+  "required_checks": ["test", "lint", "vulncheck"],
+  "ruleset_include": ["~DEFAULT_BRANCH", "refs/heads/development"],
+  "security_scan": { "initial": "pending" }
+}

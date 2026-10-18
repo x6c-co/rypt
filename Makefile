@@ -1,8 +1,11 @@
 GO ?= go
 
-.PHONY: all test race vet cover fuzz integration
+.PHONY: all check test race vet cover fuzz integration
 
 all: vet test
+
+# check is what runs before every commit.
+check: vet test
 
 test:
 	$(GO) test ./...
