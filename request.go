@@ -299,8 +299,10 @@ func retryableStatus(status int, code ErrorCode, policy retryPolicy) bool {
 // retryableErr reports whether a request whose exchange failed with err may
 // be sent again. A failure to connect never sent the request, so it may
 // always be repeated; any other failure may have happened after the API
-// received the request. A certificate the client does not trust, or a
-// server that does not speak TLS, fails the same way every time.
+// received the request. A failure to reach a proxy is a failure to connect
+// too: net/http reports it as a "proxyconnect" error around the dial error.
+// A certificate the client does not trust, or a server that does not speak
+// TLS, fails the same way every time.
 func retryableErr(err error, policy retryPolicy) bool {
 	var (
 		verifyErr  *tls.CertificateVerificationError
@@ -318,7 +320,7 @@ func retryableErr(err error, policy retryPolicy) bool {
 		errors.As(err, &invalidErr),
 		errors.Is(err, http.ErrSchemeMismatch):
 		return false
-	case errors.As(err, &opErr) && opErr.Op == "dial":
+	case errors.As(err, &opErr) && (opErr.Op == "dial" || opErr.Op == "proxyconnect"):
 		return true
 	}
 	return policy == retryIfTransient

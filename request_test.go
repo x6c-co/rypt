@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -212,6 +213,25 @@ func TestDialErrorRetried(t *testing.T) {
 		t.Errorf("got %s", sprint(e))
 	}
 	assertPrintable(t, e.Error())
+}
+
+// TestProxyDialErrorRetried: a proxy that cannot be reached was sent
+// nothing either.
+func TestProxyDialErrorRetried(t *testing.T) {
+	proxy, err := url.Parse(closedURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxy)}}
+	c, err := NewClient(testToken, WithHTTPClient(hc), WithBackoff(noBackoff))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.CreateKey(t.Context(), &CreateKeyParams{Name: "k", Tier: TierFree})
+	e := asError(t, err)
+	if e.Kind != KindTransport || e.Attempts != DefaultMaxAttempts {
+		t.Errorf("got %s", sprint(e))
+	}
 }
 
 func TestTLSErrorNotRetried(t *testing.T) {
