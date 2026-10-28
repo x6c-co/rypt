@@ -6,6 +6,13 @@ follows [semantic versioning](https://semver.org).
 
 ## Unreleased
 
+### Fixed
+
+- A request that fails because the HTTPS proxy cannot be reached is now
+  retried like any other failure to connect, as the package documentation
+  says. Before, a call that is not repeated once it may have reached the API,
+  such as `CreateKey`, failed after one attempt.
+
 ## v0.1.0
 
 The first release, written against version 0.15.0 of the rypt API.
