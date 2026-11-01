@@ -20,7 +20,7 @@
 - Every external input is validated before use in SQL, shell, file paths, or templates.
 - Cryptography uses the standard library or a vetted library; no custom primitives.
 - Errors returned to clients never include stack traces, SQL, or secrets.
-- The token is sent only to the configured base URL over https (plain http only to a loopback host), and redirects are never followed.
+- The token is sent only to the configured base URL over https (plain http only to the addresses 127.0.0.1 and ::1, never to a name such as localhost), and redirects are never followed.
 - Server-supplied text in an error has control and format characters removed and any copy of the token redacted before it is kept.
 - Plaintexts, data keys and request/response bodies that carry them stay byte slices, and the client clears its own copies when a call ends.
 

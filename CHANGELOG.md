@@ -6,6 +6,17 @@ follows [semantic versioning](https://semver.org).
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** `WithBaseURL` allows plain `http` only for the addresses
+  `127.0.0.1` and `::1`, and no longer for the name `localhost`. A name is
+  looked up, and the lookup can reach DNS when the hosts file does not list
+  `localhost`, or when DNS comes first in the lookup order. The resolver
+  then asks for `localhost.<search domain>` first, so whoever controls that
+  zone can answer with another machine, which would receive the token in
+  clear text. Use `http://127.0.0.1` or `http://[::1]` for a local server,
+  or `https://localhost`.
+
 ## v0.1.0
 
 The first release, written against version 0.15.0 of the rypt API.

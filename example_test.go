@@ -81,7 +81,7 @@ func ExampleNewClient() {
 }
 
 func ExampleNewClient_localServer() {
-	// Plain http is allowed only to a loopback host.
+	// Plain http is allowed only to 127.0.0.1 and [::1].
 	client, err := rypt.NewClient(os.Getenv("RYPT_TOKEN"), rypt.WithBaseURL("http://127.0.0.1:8080"))
 	if err != nil {
 		log.Fatal(err)

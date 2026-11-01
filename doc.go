@@ -70,8 +70,8 @@
 // than preventing it.
 //
 // The client refuses to follow redirects, so the token and request bodies
-// are never sent to another URL, and it only talks plain HTTP to a loopback
-// host. See [NewClient] and [WithHTTPClient].
+// are never sent to another URL, and it talks plain HTTP only to 127.0.0.1
+// and ::1. See [WithBaseURL] and [WithHTTPClient].
 //
 // # API version
 //
