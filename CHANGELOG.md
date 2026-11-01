@@ -6,6 +6,13 @@ follows [semantic versioning](https://semver.org).
 
 ## Unreleased
 
+## v0.2.0
+
+### Added
+
+- Each GitHub release has a CycloneDX SBOM of the module and its
+  requirements attached, as `rypt-<tag>.cdx.json`.
+
 ### Changed
 
 - **Breaking:** `WithBaseURL` allows plain `http` only for the addresses
