@@ -41,14 +41,27 @@ func TestBaseURL(t *testing.T) {
 		{"https://api.rypt.dev/", "https://api.rypt.dev"},
 		{"https://example.com/rypt/", "https://example.com/rypt"},
 		{"https://example.com:8443", "https://example.com:8443"},
-		{"http://localhost:8080", "http://localhost:8080"},
-		{"http://LocalHost:8080", "http://localhost:8080"},
+		{"https://localhost:8443", "https://localhost:8443"},
 		{"http://127.0.0.1:8080", "http://127.0.0.1:8080"},
+		{"http://127.0.0.1", "http://127.0.0.1"},
+		{"HTTP://127.0.0.1:8080", "http://127.0.0.1:8080"},
 		{"http://[::1]:8080", "http://[::1]:8080"},
+		{"http://[::1]", "http://[::1]"},
 		{"http://api.rypt.dev", ""},
-		{"http://127.0.0.2", ""},
+		// A name is looked up, so plain http to it could go anywhere.
+		{"http://localhost", ""},
+		{"http://localhost:8080", ""},
+		{"http://LocalHost:8080", ""},
+		{"http://localhost.:8080", ""},
 		{"http://localhoſt", ""},
 		{"http://localhost.example.com", ""},
+		// Other spellings of loopback addresses, and other loopback addresses.
+		{"http://127.0.0.2", ""},
+		{"http://127.1", ""},
+		{"http://2130706433", ""},
+		{"http://[::ffff:127.0.0.1]", ""},
+		{"http://[0:0:0:0:0:0:0:1]", ""},
+		{"http://[::1%25lo]:8080", ""},
 		{"ftp://api.rypt.dev", ""},
 		{"api.rypt.dev", ""},
 		{"https://", ""},
@@ -72,6 +85,11 @@ func TestBaseURL(t *testing.T) {
 		if err != nil && strings.Contains(err.Error(), "pass") {
 			t.Errorf("the error quotes the URL: %v", err)
 		}
+	}
+	// The error for http://localhost says what is allowed instead.
+	const want = "rypt: the base URL must use https unless the host is 127.0.0.1 or ::1"
+	if _, err := parseBaseURL("http://localhost:8080"); err == nil || err.Error() != want {
+		t.Errorf("parseBaseURL(http://localhost:8080): error %v, want %q", err, want)
 	}
 }
 

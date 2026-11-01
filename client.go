@@ -53,9 +53,15 @@ type options struct {
 // WithBaseURL sets the API base URL. The default is [DefaultBaseURL].
 //
 // The URL must use https, except that http is allowed when the host is
-// localhost, 127.0.0.1 or ::1, for a server under development. It must have
-// a host and no user info, query or fragment. It may have a path, which
-// then prefixes every API path.
+// 127.0.0.1 or ::1 (written [::1] in a URL), for a server under development.
+// The name localhost needs https, because a name is looked up. The lookup
+// can reach DNS when the hosts file does not list the name, or when DNS
+// comes first in the lookup order. The resolver then asks for
+// localhost.<search domain> first, so whoever controls that zone can answer
+// with another machine, which would receive the token in clear text.
+//
+// The URL must have a host and no user info, query or fragment. It may have
+// a path, which then prefixes every API path.
 func WithBaseURL(baseURL string) Option {
 	return func(o *options) { o.baseURL = baseURL }
 }
@@ -167,33 +173,29 @@ func parseBaseURL(raw string) (*url.URL, error) {
 	case u.Hostname() == "":
 		return nil, errors.New("rypt: the base URL must have a host")
 	}
-	host := u.Host
 	switch u.Scheme {
 	case "https":
 	case "http":
-		if !isLoopbackName(u.Hostname()) {
-			return nil, errors.New("rypt: the base URL must use https unless the host is localhost, 127.0.0.1 or ::1")
+		if !isLoopbackAddress(u.Hostname()) {
+			return nil, errors.New("rypt: the base URL must use https unless the host is 127.0.0.1 or ::1")
 		}
-		// net/http bypasses a proxy only for the exact name "localhost", so
-		// "LOCALHOST" would send the token through HTTP_PROXY in clear text.
-		host = strings.ToLower(host)
 	default:
 		return nil, errors.New("rypt: the base URL must use https")
 	}
 	return &url.URL{
 		Scheme:  u.Scheme,
-		Host:    host,
+		Host:    u.Host,
 		Path:    strings.TrimRight(u.Path, "/"),
 		RawPath: strings.TrimRight(u.RawPath, "/"),
 	}, nil
 }
 
-// isLoopbackName reports whether host is one of the names for which plain
-// http is allowed. It deliberately matches names, not address ranges. The
-// comparison ignores ASCII case only: strings.EqualFold would also accept
-// non-ASCII look-alikes such as "localhoſt".
-func isLoopbackName(host string) bool {
-	return strings.ToLower(host) == "localhost" || host == "127.0.0.1" || host == "::1"
+// isLoopbackAddress reports whether host is one of the two addresses to
+// which plain http is allowed. It deliberately matches these exact
+// strings: not names, which are looked up and could resolve to another
+// machine, and not other spellings or address ranges.
+func isLoopbackAddress(host string) bool {
+	return host == "127.0.0.1" || host == "::1"
 }
 
 // refuseRedirect makes an http.Client return a redirect response as it is,
@@ -220,7 +222,7 @@ func defaultHTTPClient() *http.Client {
 }
 
 // httpsOnlyProxy returns a proxy function that uses next for https requests
-// only. Plain http is only ever allowed to a loopback host, and through a
+// only. Plain http is only ever allowed to 127.0.0.1 or ::1, and through a
 // proxy the token would travel in clear text. https requests still use
 // HTTPS_PROXY, through a CONNECT tunnel that carries the TLS session.
 func httpsOnlyProxy(next func(*http.Request) (*url.URL, error)) func(*http.Request) (*url.URL, error) {
